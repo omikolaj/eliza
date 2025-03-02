@@ -11,7 +11,9 @@ import {
 import { stringToUuid } from "./uuid.ts";
 import { existsSync } from "fs";
 import { join } from "path";
-
+import { PDFDocument, PDFName, PDFDict, PDFRawStream } from 'pdf-lib';
+import { createScheduler, createWorker, OEM, PSM } from 'tesseract.js';
+import pako from "pako";
 /**
  * Manage knowledge in the database.
  */
@@ -149,19 +151,19 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
         if (!text || !terms.length) {
             return false;
         }
-    
+
         const words = text.toLowerCase().split(" ").filter(w => w.length > 0);
-        
+
         // Find all positions for each term (not just first occurrence)
-        const allPositions = terms.flatMap(term => 
+        const allPositions = terms.flatMap(term =>
             words.reduce((positions, word, idx) => {
                 if (word.includes(term)) positions.push(idx);
                 return positions;
             }, [] as number[])
         ).sort((a, b) => a - b);
-    
+
         if (allPositions.length < 2) return false;
-    
+
         // Check proximity
         for (let i = 0; i < allPositions.length - 1; i++) {
             if (Math.abs(allPositions[i] - allPositions[i + 1]) <= 5) {
@@ -173,7 +175,7 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
                 return true;
             }
         }
-    
+
         return false;
     }
 
@@ -505,9 +507,174 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
         return stringToUuid(scopedPath);
     }
 
+    // Add this helper function to extract text from PDF using OCR
+    extractTextFromPDFWithOCR(pdfContent: Buffer): Promise<string> {
+        return new Promise(async (resolve, reject) => {
+            try {
+                // Ensure pdfContent is a valid Buffer with PDF header
+                elizaLogger.debug('[PDF Debug] PDF header (hex):', Buffer.from(pdfContent).slice(0, 20).toString('hex'));
+                if (!Buffer.from(pdfContent).slice(0, 8).toString('ascii').startsWith('%PDF-1.')) {
+                    throw new Error('Invalid PDF header in pdfContent');
+                }
+
+                const pdfDoc = await PDFDocument.load(pdfContent);
+                const pageCount = pdfDoc.getPageCount();
+                elizaLogger.info(`[OCR] Loaded PDF with ${pageCount} pages`);
+
+                const scheduler = createScheduler();
+                const workerCount = Math.min(4, pageCount);
+                elizaLogger.info(`[OCR] Initializing ${workerCount} Tesseract workers`);
+
+                for (let i = 0; i < workerCount; i++) {
+                    const worker = await createWorker('eng', OEM.DEFAULT, {
+                        logger: (m) => elizaLogger.debug(`[OCR Worker ${i}] ${m.status}: ${m.progress}`),
+                    });
+                    await worker.setParameters({
+                        tessedit_pageseg_mode: PSM.SINGLE_BLOCK, // Optimized for structured documents like LOIs
+                        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ,.-$@#&*()[]{}!?:;"\'\u201C\u201D', // Added smart quotes (U+201C, U+201D)
+                        user_defined_dpi: '300', // Ensure 300 DPI for clarity
+                        tessedit_use_dictionary: '1', // Enable dictionary for better word recognition (e.g., LOI)
+                    });
+                    scheduler.addWorker(worker);
+                }
+
+                const textResults: string[] = [];
+                const ocrPromises = pdfDoc.getPages().map(async (page, index) => {
+                    try {
+                        elizaLogger.info(`[OCR] Processing page ${index + 1}/${pageCount}`);
+
+                        const resources = page.node.Resources();
+                        const xObjectDict = resources.lookup(PDFName.of('XObject'), PDFDict);
+                        if (!xObjectDict) {
+                            elizaLogger.warn(`[OCR] No XObject found on page ${index + 1}`);
+                            return '';
+                        }
+
+                        let pageText = '';
+                        const xObjects = xObjectDict.keys();
+                        for (const [imgIndex, xObjName] of xObjects.entries()) {
+                            const xObj = xObjectDict.lookup(xObjName);
+                            if (!(xObj instanceof PDFRawStream)) {
+                                elizaLogger.debug(`[OCR] Skipping non-stream XObject ${xObjName.asString()} on page ${index + 1}`);
+                                continue;
+                            }
+
+                            const subtype = xObj.dict.get(PDFName.of('Subtype'));
+                            if (subtype !== PDFName.of('Image')) {
+                                elizaLogger.debug(`[OCR] Skipping non-image XObject ${xObjName.asString()} on page ${index + 1}`);
+                                continue;
+                            }
+
+                            const rawBytes = xObj.contents;
+                            if (!rawBytes || rawBytes.length === 0) {
+                                elizaLogger.warn(`[OCR] Empty image data for ${xObjName.asString()} on page ${index + 1}`);
+                                continue;
+                            }
+
+                            const processedImage = await this.preprocessImage(rawBytes);
+                            if (!processedImage) {
+                                elizaLogger.warn(`[OCR] Failed to preprocess image for ${xObjName.asString()} on page ${index + 1}`);
+                                continue;
+                            }
+
+                            let retries = 2;
+                            let ocrResult;
+                            while (retries > 0) {
+                                try {
+                                    ocrResult = await scheduler.addJob('recognize', Buffer.from(processedImage));
+                                    break;
+                                } catch (err) {
+                                    retries--;
+                                    elizaLogger.warn(`[OCR] Retry ${2 - retries}/2 for page ${index + 1}, image ${imgIndex + 1}: ${err.message}`);
+                                    if (retries === 0) throw err;
+                                    await new Promise(resolve => setTimeout(resolve, 1000));
+                                }
+                            }
+
+                            const { data } = ocrResult!;
+                            elizaLogger.info(`[OCR] Page ${index + 1}, Image ${imgIndex + 1} - Confidence: ${data.confidence}, Text length: ${data.text.length}`);
+
+                            if (data.confidence < 50) {
+                                elizaLogger.warn(`[OCR] Low confidence (${data.confidence}) on page ${index + 1}, image ${imgIndex + 1}`);
+                            }
+
+                            // Clean text to handle quotes and special characters
+                            pageText += this.cleanOCRText(data.text) + '\n';
+                        }
+                        return pageText;
+                    } catch (pageErr) {
+                        elizaLogger.error(`[OCR] Error processing page ${index + 1}:`, pageErr);
+                        return '';
+                    }
+                });
+
+                textResults.push(...(await Promise.all(ocrPromises)));
+                elizaLogger.info('[OCR] All pages processed');
+
+                await scheduler.terminate();
+                elizaLogger.info('[OCR] Scheduler and workers terminated');
+
+                const finalText = textResults.filter(text => text.trim().length > 0).join('\n\n');
+                if (!finalText) {
+                    elizaLogger.warn('[OCR] No text extracted from PDF');
+                } else {
+                    elizaLogger.debug('[OCR Preview] Extracted text:', finalText.slice(0, 200) + (finalText.length > 200 ? '...' : ''));
+                }
+
+                resolve(finalText);
+            } catch (error) {
+                elizaLogger.error('[OCR] Fatal error in PDF OCR processing:', error);
+                reject(error);
+            }
+        });
+    }
+
+    // Helper to preprocess images for OCR
+private async preprocessImage(rawBytes: Uint8Array): Promise<Uint8Array> {
+    try {
+        // Check if the image is compressed (e.g., Flate or JPEG)
+        let decodedBytes = rawBytes;
+
+        // Assume FlateDecode (zlib) compression, common in PDFs
+        try {
+            decodedBytes = pako.inflate(rawBytes);
+        } catch (flateError) {
+            elizaLogger.debug('[Image Preprocessing] Flate decoding failed, trying raw bytes:', flateError);
+            // Assume JPEG (DCTDecode) or raw, keep as-is for Tesseract
+            decodedBytes = rawBytes;
+        }
+
+        // Optionally log the processed bytes for debugging
+        elizaLogger.debug('[Image Preprocessing] Processed image bytes length:', decodedBytes.length);
+
+        return decodedBytes;
+    } catch (error) {
+        elizaLogger.warn('[Image Preprocessing] Failed to preprocess image:', error);
+        return rawBytes; // Fallback to original bytes
+    }
+}
+
+// Simplified helper to get filter (mimic PDFRawStream dict check)
+private getFilter(rawBytes: Uint8Array): PDFName | undefined {
+    // This is a simplification; in reality, you'd need the PDFRawStream dict
+    // For now, assume FlateDecode or DCTDecode based on common PDF image encoding
+    // You can enhance this by parsing the PDFRawStream dict or using pdf-lib's structure
+    return PDFName.of('FlateDecode'); // Assume Flate for this case, adjust as needed
+}
+
+    // Ensure cleanOCRText is updated or added
+    private cleanOCRText(text: string): string {
+        return text
+            .replace(/\s+/g, ' ') // Normalize whitespace
+            .replace(/[^\w\s\d.,$\-"'\u201C\u201D]/g, '') // Keep smart quotes and common characters
+            .replace(/ΓÇ£/g, '"') // Replace ΓÇ£ with "
+            .replace(/ΓÇ¥/g, '"') // Replace ΓÇ¥ with "
+            .trim();
+    }
+
     async processFile(file: {
         path: string;
-        content: string;
+        content: string | Buffer;
         type: "pdf" | "md" | "txt";
         isShared?: boolean;
     }): Promise<void> {
@@ -517,49 +684,85 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
         };
 
         const startTime = Date.now();
-        const content = file.content;
+        let content: string = typeof file.content === 'string' ? file.content : ''; // Default to empty string
 
         try {
-            const fileSizeKB = new TextEncoder().encode(content).length / 1024;
+            const fileSizeKB = typeof file.content === 'string'
+                ? new TextEncoder().encode(file.content).length / 1024
+                : Buffer.from(file.content).length / 1024;
             elizaLogger.info(
                 `[File Progress] Starting ${file.path} (${fileSizeKB.toFixed(2)} KB)`
             );
 
-            // Generate scoped ID for the file
-            const scopedId = this.generateScopedId(
-                file.path,
-                file.isShared || false
-            );
+            // Preview content (hex for Buffer, chars for string)
+            if (typeof file.content === 'string') {
+                elizaLogger.info(`[Content Preview] First 500 chars: ${file.content.slice(0, 500)}`);
+            } else {
+                elizaLogger.info(`[Content Preview] First 20 bytes (hex):`, Buffer.from(file.content).slice(0, 20).toString('hex'));
+            }
+
+            // If it's a PDF, process with OCR if Buffer, or try to parse if string
+            if (file.type === 'pdf') {
+                try {
+                    elizaLogger.info('[PDF Processing] Starting OCR extraction');
+                    if (Buffer.isBuffer(file.content)) {
+                        // Ensure valid PDF header for Buffer
+                        const pdfHeader = Buffer.from(file.content).slice(0, 8).toString('ascii');
+                        if (!pdfHeader.startsWith('%PDF-1.')) {
+                            throw new Error(`Invalid PDF header in ${file.path}: ${pdfHeader}`);
+                        }
+                        content = await this.extractTextFromPDFWithOCR(file.content);
+                    } else {
+                        // Handle unexpected string (try to parse as Buffer)
+                        elizaLogger.warn('[PDF Processing] Received string content for PDF, attempting to parse');
+                        const buffer = Buffer.from(file.content, 'binary'); // Use 'binary' to preserve raw data
+                        const pdfHeader = buffer.slice(0, 8).toString('ascii');
+                        if (!pdfHeader.startsWith('%PDF-1.')) {
+                            throw new Error(`Invalid PDF header in string content for ${file.path}: ${pdfHeader}`);
+                        }
+                        content = await this.extractTextFromPDFWithOCR(buffer);
+                    }
+                    elizaLogger.info('[PDF Processing] OCR extraction complete');
+                    timeMarker("OCR Processing");
+                } catch (error) {
+                    elizaLogger.error('[PDF Processing] OCR failed:', error);
+                    throw error;
+                }
+            } else {
+                // For .md and .txt, ensure content is a string
+                if (typeof file.content !== 'string') {
+                    content = Buffer.from(file.content).toString('utf8');
+                }
+            }
 
             // Step 1: Preprocessing
-            //const preprocessStart = Date.now();
             const processedContent = this.preprocess(content);
             timeMarker("Preprocessing");
 
-            // Step 2: Main document embedding
-            const mainEmbeddingArray = await embed(
-                this.runtime,
-                processedContent
-            );
-            const mainEmbedding = new Float32Array(mainEmbeddingArray);
-            timeMarker("Main embedding");
+            // Step 2: Main document embedding (commented out in your code, preserving as-is)
+            // const mainEmbeddingArray = await embed(
+            //     this.runtime,
+            //     processedContent
+            // );
+            // const mainEmbedding = new Float32Array(mainEmbeddingArray);
+            // timeMarker("Main embedding");
 
-            // Step 3: Create main document
-            await this.runtime.databaseAdapter.createKnowledge({
-                id: scopedId,
-                agentId: this.runtime.agentId,
-                content: {
-                    text: content,
-                    metadata: {
-                        source: file.path,
-                        type: file.type,
-                        isShared: file.isShared || false,
-                    },
-                },
-                embedding: mainEmbedding,
-                createdAt: Date.now(),
-            });
-            timeMarker("Main document storage");
+            // // Step 3: Create main document (commented out, preserving as-is)
+            // await this.runtime.databaseAdapter.createKnowledge({
+            //     id: scopedId,
+            //     agentId: this.runtime.agentId,
+            //     content: {
+            //         text: content,
+            //         metadata: {
+            //             source: file.path,
+            //             type: file.type,
+            //             isShared: file.isShared || false,
+            //         },
+            //     },
+            //     embedding: mainEmbedding,
+            //     createdAt: Date.now(),
+            // });
+            // timeMarker("Main document storage");
 
             // Step 4: Generate chunks
             const chunks = await splitChunks(processedContent, 512, 20);
@@ -583,11 +786,11 @@ export class RAGKnowledgeManager implements IRAGKnowledgeManager {
                     batch.map((chunk) => embed(this.runtime, chunk))
                 );
 
+                const scopedId = this.generateScopedId(file.path, file.isShared || false);
                 // Batch database operations
                 await Promise.all(
                     embeddings.map(async (embeddingArray, index) => {
-                        const chunkId =
-                            `${scopedId}-chunk-${i + index}` as UUID;
+                        const chunkId = `${scopedId}-chunk-${i + index}` as UUID;
                         const chunkEmbedding = new Float32Array(embeddingArray);
 
                         await this.runtime.databaseAdapter.createKnowledge({

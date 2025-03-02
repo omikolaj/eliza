@@ -57,6 +57,9 @@ import {
 import { stringToUuid } from "./uuid.ts";
 import { glob } from "glob";
 import { existsSync } from "fs";
+import { PDFArray, PDFDict, PDFDocument, PDFName, PDFObject, PDFRawStream } from "pdf-lib";
+import pako from "pako";
+
 /**
  * Represents the runtime environment for an agent, handling message processing,
  * action registration, and interaction with external services like OpenAI and Supabase.
@@ -365,10 +368,10 @@ export class AgentRuntime implements IAgentRuntime {
 
         this.imageModelProvider =
             this.character.imageModelProvider ?? this.modelProvider;
-        
+
         this.imageVisionModelProvider =
             this.character.imageVisionModelProvider ?? this.modelProvider;
-            
+
         elizaLogger.info(
           `${this.character.name}(${this.agentId}) - Selected model provider:`,
           this.modelProvider
@@ -658,7 +661,6 @@ export class AgentRuntime implements IAgentRuntime {
                     contentItem = item;
                 }
 
-                // const knowledgeId = stringToUuid(contentItem);
                 const knowledgeId = this.ragKnowledgeManager.generateScopedId(
                     contentItem,
                     isShared,
@@ -675,7 +677,6 @@ export class AgentRuntime implements IAgentRuntime {
                 ) {
                     try {
                         const filePath = join(this.knowledgeRoot, contentItem);
-                        // Get existing knowledge first with more detailed logging
                         elizaLogger.debug("[RAG Query]", {
                             knowledgeId,
                             agentId: this.agentId,
@@ -689,7 +690,7 @@ export class AgentRuntime implements IAgentRuntime {
                         const existingKnowledge =
                             await this.ragKnowledgeManager.getKnowledge({
                                 id: knowledgeId,
-                                agentId: this.agentId, // Keep agentId as it's used in OR query
+                                agentId: this.agentId,
                             });
 
                         elizaLogger.debug("[RAG Query Result]", {
@@ -704,8 +705,7 @@ export class AgentRuntime implements IAgentRuntime {
                                       id: existingKnowledge[0].id,
                                       agentId: existingKnowledge[0].agentId,
                                       contentLength:
-                                          existingKnowledge[0].content.text
-                                              .length,
+                                          existingKnowledge[0].content.text.length,
                                   }
                                 : null,
                             results: existingKnowledge.map((k) => ({
@@ -715,19 +715,50 @@ export class AgentRuntime implements IAgentRuntime {
                             })),
                         });
 
-                        // Read file content
-                        const content: string = await readFile(
-                            filePath,
-                            "utf8",
-                        );
+                        // Read file as Buffer to preserve binary data
+                        const buffer: Buffer = await readFile(filePath);
+                        let content: string;
+
+                        if (fileExtension === "pdf") {
+                            try {
+                                const buffer: Buffer = await readFile(filePath);
+                                elizaLogger.info('[Content Preview] First 20 bytes (hex):', buffer.slice(0, 20).toString('hex'));
+
+                                const pdfHeader = buffer.slice(0, 8).toString('ascii');
+                                if (!pdfHeader.startsWith('%PDF-1.')) {
+                                    throw new Error(`Invalid PDF header in ${filePath}: ${pdfHeader}`);
+                                }
+
+                                elizaLogger.info(
+                                    `[PDF Processing] Processing PDF with OCR: ${contentItem}`
+                                );
+                                // Pass buffer (Buffer) directly, not as a string
+                                await this.ragKnowledgeManager.processFile({
+                                    path: contentItem,
+                                    content: buffer, // Ensure this is Buffer, not string
+                                    type: fileExtension as "pdf" | "md" | "txt",
+                                    isShared: isShared,
+                                });
+                            } catch (error: any) {
+                                hasError = true;
+                                elizaLogger.error(
+                                    `Failed to read knowledge file ${contentItem}. Error details:`,
+                                    error?.message || error || "Unknown error",
+                                );
+                                continue;
+                            }
+                        } else {
+                            // For .md and .txt, read as UTF-8 string
+                            content = buffer.toString('utf8');
+                        }
+
                         if (!content) {
                             hasError = true;
                             continue;
                         }
 
                         if (existingKnowledge.length > 0) {
-                            const existingContent =
-                                existingKnowledge[0].content.text;
+                            const existingContent = existingKnowledge[0].content.text;
 
                             elizaLogger.debug("[RAG Compare]", {
                                 path: contentItem,
@@ -736,10 +767,7 @@ export class AgentRuntime implements IAgentRuntime {
                                 existingContentLength: existingContent.length,
                                 newContentLength: content.length,
                                 contentSample: content.slice(0, 100),
-                                existingContentSample: existingContent.slice(
-                                    0,
-                                    100,
-                                ),
+                                existingContentSample: existingContent.slice(0, 100),
                                 matches: existingContent === content,
                             });
 
@@ -754,9 +782,7 @@ export class AgentRuntime implements IAgentRuntime {
                             elizaLogger.info(
                                 `${isShared ? "Shared knowledge" : "Knowledge"} ${contentItem} changed, updating...`,
                             );
-                            await this.ragKnowledgeManager.removeKnowledge(
-                                knowledgeId,
-                            );
+                            await this.ragKnowledgeManager.removeKnowledge(knowledgeId);
                             await this.ragKnowledgeManager.removeKnowledge(
                                 `${knowledgeId}-chunk-*` as UUID,
                             );
@@ -824,14 +850,96 @@ export class AgentRuntime implements IAgentRuntime {
                 );
                 continue;
             }
-        }
 
-        if (hasError) {
-            elizaLogger.warn(
-                "Some knowledge items failed to process, but continuing with available knowledge",
-            );
+            if (hasError) {
+                elizaLogger.warn(
+                    "Some knowledge items failed to process, but continuing with available knowledge",
+                );
+            }
         }
     }
+
+            // Helper method to detect if a PDF is scanned (image-based)
+            private async isScannedPDF(pdfDoc: PDFDocument): Promise<boolean> {
+                let hasImages = false;
+                let hasText = false;
+                return true;
+
+                // for (const page of pdfDoc.getPages()) {
+                //     const resources = page.node.Resources();
+                //     if (!resources) continue;
+
+                //     // Check for XObjects (images)
+                //     const xObjectDict = resources.lookup(PDFName.of('XObject'), PDFDict);
+                //     if (xObjectDict) {
+                //         const xObjects = xObjectDict.keys();
+                //         for (const xObjName of xObjects) {
+                //             const xObj = xObjectDict.lookup(xObjName);
+                //             if (xObj instanceof PDFRawStream) {
+                //                 const subtype = xObj.dict.get(PDFName.of('Subtype'));
+                //                 if (subtype === PDFName.of('Image')) {
+                //                     hasImages = true;
+                //                 }
+                //             }
+                //         }
+                //     }
+
+                //     // Check for text (simplified check for Fonts or Contents)
+                //     const contents = page.node.Contents();
+                //     if (contents && contents instanceof PDFArray && contents.size() > 0) {
+                //         hasText = true;
+                //     }
+
+                //     const fontDict = resources.lookup(PDFName.of('Font'), PDFDict);
+                //     if (fontDict && fontDict.keys().length > 0) {
+                //         hasText = true;
+                //     }
+                // }
+
+                // // If there are images but no text, assume it's scanned
+                // return hasImages && !hasText;
+            }
+
+            // Helper method to extract text from organic PDFs
+            private async extractTextFromOrganicPDF(pdfDoc: PDFDocument): Promise<string> {
+                let text = '';
+                for (const page of pdfDoc.getPages()) {
+                    // Simplified text extraction (assuming text content is available)
+                    const contents = page.node.Contents();
+                    if (contents) {
+                        // This is a basic approach; for robust text extraction, you might need to parse content streams
+                        text += await this.parseContentStream(contents) + '\n\n';
+                    }
+                }
+                return text.trim() || 'No text extracted from organic PDF';
+            }
+
+            // Basic content stream parser (simplified for organic PDFs)
+            private async parseContentStream(contents: PDFObject): Promise<string> {
+                if (contents instanceof PDFRawStream) {
+                    const decoded = await this.decodeStream(contents);
+                    return decoded.toString('utf8').replace(/\n\s*\n/g, '\n'); // Basic cleanup
+                }
+                return '';
+            }
+
+            // Helper to decode PDF streams (simplified)
+            private async decodeStream(stream: PDFRawStream): Promise<Buffer> {
+                try {
+                    // Check if the stream uses FlateDecode (common in PDFs)
+                    const filter = stream.dict.get(PDFName.of('Filter'));
+                    if (filter === PDFName.of('FlateDecode') || filter === PDFName.of('Fl')) {
+                        // Decode Flate (zlib) compressed data using pako
+                        const decompressed = pako.inflate(stream.contents);
+                        return Buffer.from(decompressed);
+                    }
+                    // If no FlateDecode, return raw bytes as Buffer
+                    return Buffer.from(stream.contents);
+                } catch (error) {
+                    elizaLogger.warn('[PDF Decoding] Failed to decode stream:', error);
+                    return Buffer.from(stream.contents); // Fallback to raw bytes
+                }
+            }
 
     /**
      * Processes directory-based RAG knowledge by recursively loading and processing files.
@@ -1796,12 +1904,12 @@ const formatKnowledge = (knowledge: KnowledgeItem[]) => {
     return knowledge.map(item => {
         // Get the main content text
         const text = item.content.text;
-        
+
         // Clean up formatting but maintain natural text flow
         const cleanedText = text
             .trim()
             .replace(/\n{3,}/g, '\n\n'); // Replace excessive newlines
-            
+
         return cleanedText;
     }).join('\n\n'); // Separate distinct pieces with double newlines
 };

@@ -65,7 +65,10 @@
         "uuid": "11.0.3",
         "viem": "2.21.58",
         "vitest": "^3.0.5",
-        "zod": "^3.24.2"
+        "zod": "^3.24.2",
+        "tesseract.js": "6.0.0",
+        "pdf-lib": "1.17.1",
+        "pako": "2.1.0"
     },
     "publishConfig": {
         "access": "public"

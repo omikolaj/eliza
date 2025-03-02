@@ -1238,10 +1238,12 @@ export interface IRAGKnowledgeManager {
     clearKnowledge(shared?: boolean): Promise<void>;
     processFile(file: {
         path: string;
-        content: string;
+        content: string | Buffer;
         type: "pdf" | "md" | "txt";
         isShared: boolean;
     }): Promise<void>;
+
+    extractTextFromPDFWithOCR(pdfContent: string | Buffer): Promise<string>;
     cleanupDeletedKnowledgeFiles(): Promise<void>;
     generateScopedId(path: string, isShared: boolean): UUID;
 }
